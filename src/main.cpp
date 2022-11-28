@@ -2,6 +2,7 @@
 #include <SPI.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
+#include <PID_v1.h>
 #include "Adafruit_MAX31855.h"
 
 #define TC_DO_PIN 19
@@ -29,6 +30,8 @@ Adafruit_MAX31855 thermocouple2(TC_CLK_PIN, TC2_CS_PIN, TC_DO_PIN);
 #define OLED_RESET -1 // Reset pin # (or -1 if sharing Arduino reset pin)
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
+const int loopDelay = 100;
+
 const int tc1TempX = 0;
 const int tc1TempY = 1;
 const int tc1TempWidth = SCREEN_WIDTH;
@@ -40,26 +43,52 @@ const int tc2TempHeight = 8;
 const int lmt85X = 0;
 const int lmt85Y = 21;
 const int lmt85Width = SCREEN_WIDTH;
-const int lmt85Height = 20;
+const int lmt85Height = 8;
+const int setpointX = 0;
+const int setpointY = 31;
+const int setpointWidth = SCREEN_WIDTH;
+const int setpointHeight = 8;
 
 double tc1TempC = 0.0;
 double tc2TempC = 0.0;
 int lmt85_mV = 0;
 
-double c2f(double celcuis);
+double c2f(double celsius);
+void IRAM_ATTR btnHandler();
+void IRAM_ATTR btnDebounce(void *);
 double getLMT85Temp(int lmt85_mV);
 
-bool btnState = false;
+esp_timer_handle_t btnTimer;
+esp_timer_create_args_t btnTimerArgs;
+const int debounceTime_us = 25000;
+const int lowTemp = 0;
+const int highTemp = 150;
+unsigned long enableButtonTime = 0;
+bool buttonEnabled = false;
+
+volatile double pendingSetpoint = lowTemp;
+double setpoint = -1.0;
+double Kp = 800.0;
+double Ki = 0.8;
+double Kd = 500.0;
+double pidOutput = 0.0;
+PID pid(&tc1TempC, &pidOutput, &setpoint, Kp, Ki, Kd, DIRECT);
+int windowSize = 90;
+unsigned long windowStartTime = 0;
+unsigned long nextDisplayUpdate = 0;
+
+// setting PWM properties
+const int freq = 15;
+const int ledChannel = 0;
+const int resolution = 12;
 
 void setup()
 {
     Serial.begin(115200);
 
-    // wait for Serial on Leonardo/Zero, etc
-    while (!Serial)
-    {
-        delay(1);
-    }
+    // Give the serial monitor a couple of
+    // seconds to start up
+    delay(2000);
 
     Serial.println("Solder Reflow Plate Controller V1.0");
 
@@ -67,9 +96,17 @@ void setup()
     // heater is off to start
     Serial.print("Initializing heater to off...");
     pinMode(FET_PIN, OUTPUT);
-    digitalWrite(FET_PIN, HIGH);
-    delay(5);
     digitalWrite(FET_PIN, LOW);
+    if (ledcSetup(ledChannel, freq, resolution) == 0)
+    {
+        Serial.printf("ledcSetup failed!");
+        while (1)
+        {
+            delay(10);
+        }
+    }
+    ledcAttachPin(FET_PIN, ledChannel);
+    ledcWrite(ledChannel, pidOutput);
     Serial.println("DONE.");
 
     // Wait for thermocouple chips to stabilize
@@ -114,15 +151,44 @@ void setup()
     display.setTextColor(SSD1306_WHITE);
     display.display();
 
+    // Set up on board GPIO0 button, but
+    // don't attach interrupt now. It
+    // will be attached after a delay in
+    // loop
     pinMode(BTN_PIN, INPUT);
-    btnState = digitalRead(BTN_PIN) == HIGH;
+    btnTimerArgs.callback = btnDebounce;
+    esp_timer_create(&btnTimerArgs, &btnTimer);
+    enableButtonTime = millis() + 5000;
+
+    windowStartTime = millis();
+    int maxForResolution = (1 << resolution) - 1;
+    Serial.printf("resolution: %d maxLimit: %d\n", resolution, maxForResolution);
+    pid.SetOutputLimits(0, maxForResolution);
+    pid.SetSampleTime(loopDelay);
+    pid.SetMode(AUTOMATIC);
+
+    nextDisplayUpdate = millis();
 }
 
 void loop()
 {
     double c = 0.0;
     bool displayStuffHappened = false;
+    unsigned long now = millis();
 
+    // Attach interrupt for GPIO0 button
+    // if the delay has passed and the button
+    // is not being pressed
+    if (!buttonEnabled &&
+        (now > enableButtonTime) &&
+        (digitalRead(BTN_PIN) == HIGH))
+    {
+        Serial.println("Enabling button");
+        attachInterrupt(BTN_PIN, btnHandler, FALLING);
+        buttonEnabled = true;
+    }
+
+    // Read TC1 input
     c = thermocouple1.readCelsius();
     if (isnan(c))
     {
@@ -141,14 +207,24 @@ void loop()
         {
             // Save new value
             tc1TempC = c;
+        }
 
-            // Update display
+        // Update display
+        if (now > nextDisplayUpdate)
+        {
             display.fillRect(tc1TempX, tc1TempY, tc1TempWidth, tc1TempHeight, SSD1306_BLACK);
             display.setCursor(tc1TempX, tc1TempY);
             display.printf("T1: %6.2f C %6.2f F", tc1TempC, c2f(tc1TempC));
             displayStuffHappened = true;
         }
     }
+
+    // Compute output power based on TC1
+    // input and apply it
+    pid.Compute();
+    ledcWrite(ledChannel, pidOutput);
+
+    // Read TC2 input
     c = thermocouple2.readCelsius();
     if (isnan(c))
     {
@@ -167,8 +243,11 @@ void loop()
         {
             // Save new value
             tc2TempC = c;
+        }
 
-            // Update display
+        // Update display
+        if (now > nextDisplayUpdate)
+        {
             display.fillRect(tc2TempX, tc2TempY, tc2TempWidth, tc2TempHeight, SSD1306_BLACK);
             display.setCursor(tc2TempX, tc2TempY);
             display.printf("T2: %6.2f C %6.2f F", tc2TempC, c2f(tc2TempC));
@@ -196,16 +275,28 @@ void loop()
     {
         // Save new value
         lmt85_mV = tmp;
+    }
 
+    // Update display
+    if (now > nextDisplayUpdate)
+    {
         // Look up temp for this voltage
         double c = getLMT85Temp(lmt85_mV);
 
-        // Update display
         display.fillRect(lmt85X, lmt85Y, lmt85Width, lmt85Height, SSD1306_BLACK);
         display.setCursor(lmt85X, lmt85Y);
         display.printf("LM: %6.2f C %6.2f F", c, c2f(c));
-        display.setCursor(lmt85X, lmt85Y + 10);
-        display.printf("      %4d mV", lmt85_mV);
+        displayStuffHappened = true;
+    }
+
+    if (pendingSetpoint != setpoint)
+    {
+        setpoint = pendingSetpoint;
+
+        // Update display
+        display.fillRect(setpointX, setpointY, setpointWidth, setpointHeight, SSD1306_BLACK);
+        display.setCursor(setpointX, setpointY);
+        display.printf("SP: %6.2f C %6.2f F", setpoint, c2f(setpoint));
         displayStuffHappened = true;
     }
 
@@ -215,29 +306,56 @@ void loop()
         display.display();
     }
 
-    bool tmp2 = digitalRead(BTN_PIN) == HIGH;
-    if (tmp2 != btnState)
+    if (now > nextDisplayUpdate)
     {
-        btnState = tmp2;
-
-        if (btnState == false)
-        {
-            Serial.println("Heater ON");
-            digitalWrite(FET_PIN, HIGH);
-        }
-        else
-        {
-            Serial.println("Heater OFF");
-            digitalWrite(FET_PIN, LOW);
-        }
+        nextDisplayUpdate += 500;
     }
 
-    delay(250);
+    delay(loopDelay);
 }
 
-double c2f(double celcuis)
+double c2f(double celsius)
 {
-    return (celcuis * (9.0 / 5.0)) + 32;
+    return (celsius * (9.0 / 5.0)) + 32;
+}
+
+void IRAM_ATTR btnHandler()
+{
+    // Software switch debounce:
+    // detach interrupt and start a
+    // timer to re-attach it after
+    // debounceTime_us microseconds
+    detachInterrupt(BTN_PIN);
+    if (btnTimer != 0)
+    {
+        esp_timer_start_once(btnTimer, debounceTime_us);
+    }
+    else
+    {
+        Serial.println("Holy shit its null");
+    }
+
+    // Change the set point
+    if (setpoint == lowTemp)
+    {
+        pendingSetpoint = highTemp;
+    }
+    else
+    {
+        pendingSetpoint = lowTemp;
+    }
+}
+
+void IRAM_ATTR btnDebounce(void *)
+{
+    if (digitalRead(BTN_PIN) == HIGH)
+    {
+        attachInterrupt(BTN_PIN, btnHandler, FALLING);
+    }
+    else
+    {
+        esp_timer_start_once(btnTimer, debounceTime_us);
+    }
 }
 
 const int lmt85Lookup[] = {301, 150,
