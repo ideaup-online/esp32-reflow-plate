@@ -15,21 +15,22 @@
 
 struct ReflowCurvePoint
 {
-    int time_s;
+    int time_ms;
     int temp_c;
 };
 ReflowCurvePoint chipQuikCurve[] = {
     {0, 25},
-    {90, 90},
-    {180, 130},
-    {210, 138},
-    {240, 165},
+    {90000, 90},
+    {180000, 130},
+    {210000, 138},
+    {240000, 165},
+    {270000, 138},
     {-1, -1},
 };
-int reflowCurveIdx = 0;
 volatile bool startReflowCurve = false;
 volatile bool cancelReflowCurve = false;
 bool reflowCurveRunning = false;
+unsigned long reflowStartMillis = 0;
 
 // Pin definitions
 #define TC_DO_PIN 19
@@ -101,8 +102,8 @@ const int highTemp = 150;
 
 // PID controller
 volatile double pendingSetpoint = lowTemp;
-double Kp = 80.0;
-double Ki = 0.25;
+double Kp = 200.0;
+double Ki = 0.625;
 double Kd = 1.0;
 double pidInput = 0.0;
 double pidOutput = 0.0;
@@ -392,6 +393,31 @@ void loop()
             data.setSetpoint(0.0);
             Serial.println("Canceling reflow curve");
         }
+        else
+        {
+            unsigned long curveTime = millis() - reflowStartMillis;
+            double newSetpoint = 0.0;
+            for (int i = 0; chipQuikCurve[i].time_ms != -1; i++)
+            {
+                if (curveTime < chipQuikCurve[i].time_ms)
+                {
+                    if (i > 0)
+                    {
+                        double timePct = (double)(curveTime - chipQuikCurve[i - 1].time_ms) /
+                                         (double)(chipQuikCurve[i].time_ms - chipQuikCurve[i - 1].time_ms);
+                        newSetpoint = chipQuikCurve[i - 1].temp_c +
+                                      ((chipQuikCurve[i].temp_c - chipQuikCurve[i - 1].temp_c) * timePct);
+                        break;
+                    }
+                }
+            }
+            data.setSetpoint(newSetpoint);
+            if (newSetpoint == 0.0)
+            {
+                reflowCurveRunning = false;
+                Serial.println("Reflow curve completed");
+            }
+        }
     }
     else
     {
@@ -399,6 +425,7 @@ void loop()
         {
             startReflowCurve = false;
             reflowCurveRunning = true;
+            reflowStartMillis = millis();
             Serial.println("Starting reflow curve");
         }
     }
