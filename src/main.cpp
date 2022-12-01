@@ -102,7 +102,7 @@ const int highTemp = 150;
 
 // PID controller
 volatile double pendingSetpoint = lowTemp;
-double Kp = 200.0;
+double Kp = 500.0;
 double Ki = 0.625;
 double Kd = 1.0;
 double pidInput = 0.0;
