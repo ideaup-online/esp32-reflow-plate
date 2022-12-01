@@ -3,8 +3,35 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <PID_v1.h>
-#include "Adafruit_MAX31855.h"
+#include <WiFi.h>
+#include <AsyncTCP.h>
+#include <ESPmDNS.h>
+#include <ESPAsyncWebServer.h>
+#include <Adafruit_MAX31855.h>
+#include <LittleFS.h>
 
+#include "config.hpp"
+#include "data.hpp"
+
+struct ReflowCurvePoint
+{
+    int time_s;
+    int temp_c;
+};
+ReflowCurvePoint chipQuikCurve[] = {
+    {0, 25},
+    {90, 90},
+    {180, 130},
+    {210, 138},
+    {240, 165},
+    {-1, -1},
+};
+int reflowCurveIdx = 0;
+volatile bool startReflowCurve = false;
+volatile bool cancelReflowCurve = false;
+bool reflowCurveRunning = false;
+
+// Pin definitions
 #define TC_DO_PIN 19
 #define TC_CLK_PIN 18
 #define TC1_CS_PIN 4
@@ -13,74 +40,99 @@
 #define FET_PIN 27
 
 #define BTN_PIN 0
+
 #define SDA_PIN 32
 #define SCL_PIN 25
 
+// i2c address of ADC
 #define ADC_ADDR 0x36
 
+// i2c address of OLED
+// and OLED screen size
 #define OLED_ADDR 0x3c
-#define SCREEN_WIDTH 128 // OLED display width, in pixels
-#define SCREEN_HEIGHT 64 // OLED display height, in pixels
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
 
-// Initialize the Thermocouples
+// Reads config information from
+// a JSON file stored in flash
+// (LittleFS)
+Config config;
+
+// Object to hold all sensor data
+Data data;
+
+// Mutex to serialize access
+// to the i2c bus
+SemaphoreHandle_t i2cMutex;
+
+// Objects to communicate with
+// thermocouple amplifiers
+// (MAX31855) via SPI
 Adafruit_MAX31855 thermocouple1(TC_CLK_PIN, TC1_CS_PIN, TC_DO_PIN);
 Adafruit_MAX31855 thermocouple2(TC_CLK_PIN, TC2_CS_PIN, TC_DO_PIN);
 
-// Declaration for an SSD1306 display connected to I2C (SDA, SCL pins)
-#define OLED_RESET -1 // Reset pin # (or -1 if sharing Arduino reset pin)
-Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
-
+// The delay between each iteration
+// of the loop() function. This
+// is the sample frequency of the
+// PID controller (ms)
 const int loopDelay = 100;
 
-const int tc1TempX = 0;
-const int tc1TempY = 1;
-const int tc1TempWidth = SCREEN_WIDTH;
-const int tc1TempHeight = 8;
-const int tc2TempX = 0;
-const int tc2TempY = 11;
-const int tc2TempWidth = SCREEN_WIDTH;
-const int tc2TempHeight = 8;
-const int lmt85X = 0;
-const int lmt85Y = 21;
-const int lmt85Width = SCREEN_WIDTH;
-const int lmt85Height = 8;
-const int setpointX = 0;
-const int setpointY = 31;
-const int setpointWidth = SCREEN_WIDTH;
-const int setpointHeight = 8;
+// Thermocouple reader task
+TaskHandle_t tcTaskHandle;
+const int tcNumSamplesToAvg = 4;
+const int tcDelay = loopDelay / tcNumSamplesToAvg;
 
-double tc1TempC = 0.0;
-double tc2TempC = 0.0;
-int lmt85_mV = 0;
+// LMT85 reader task
+TaskHandle_t lmt85TaskHandle;
+const int lmt85NumSamplesToAvg = 4;
+const int lmt85Delay = loopDelay / lmt85NumSamplesToAvg;
 
-double c2f(double celsius);
-void IRAM_ATTR btnHandler();
-void IRAM_ATTR btnDebounce(void *);
-double getLMT85Temp(int lmt85_mV);
+// OLED display
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+TaskHandle_t updateDisplayTaskHandle;
+int displayRefreshPeriod = 500;
 
+// GPIO0 button
 esp_timer_handle_t btnTimer;
 esp_timer_create_args_t btnTimerArgs;
 const int debounceTime_us = 25000;
 const int lowTemp = 0;
 const int highTemp = 150;
-unsigned long enableButtonTime = 0;
-bool buttonEnabled = false;
 
+// PID controller
 volatile double pendingSetpoint = lowTemp;
-double setpoint = -1.0;
-double Kp = 800.0;
-double Ki = 0.8;
-double Kd = 500.0;
+double Kp = 80.0;
+double Ki = 0.25;
+double Kd = 1.0;
+double pidInput = 0.0;
 double pidOutput = 0.0;
-PID pid(&tc1TempC, &pidOutput, &setpoint, Kp, Ki, Kd, DIRECT);
-int windowSize = 90;
-unsigned long windowStartTime = 0;
-unsigned long nextDisplayUpdate = 0;
+double pidSetpoint = 0.0;
+PID pid(&pidInput, &pidOutput, &pidSetpoint, Kp, Ki, Kd, DIRECT);
 
 // setting PWM properties
 const int freq = 15;
 const int ledChannel = 0;
 const int resolution = 12;
+
+// CSV server
+const int csvServerPort = 2112;
+TaskHandle_t csvServerTaskHandle;
+const int csvReportingDelay = loopDelay;
+struct Connection
+{
+    WiFiClient client;
+    unsigned long zeroMillis;
+};
+
+// Prototypes
+double c2f(double celsius);
+void readThermocouples(void *);
+void readLMT85(void *);
+void updateDisplay(void *);
+void csvServer(void *);
+void IRAM_ATTR btnHandler();
+void IRAM_ATTR btnDebounce(void *);
+double getLMT85Temp(int lmt85_mV);
 
 void setup()
 {
@@ -94,40 +146,131 @@ void setup()
 
     // Set up heater pin and ensure
     // heater is off to start
-    Serial.print("Initializing heater to off...");
+    Serial.printf("Initializing heater to off...");
     pinMode(FET_PIN, OUTPUT);
     digitalWrite(FET_PIN, LOW);
     if (ledcSetup(ledChannel, freq, resolution) == 0)
     {
         Serial.printf("ledcSetup failed!");
-        while (1)
+        while (true)
         {
             delay(10);
         }
     }
     ledcAttachPin(FET_PIN, ledChannel);
     ledcWrite(ledChannel, pidOutput);
-    Serial.println("DONE.");
+    Serial.printf("done.\n");
 
-    // Wait for thermocouple chips to stabilize
-    delay(500);
-    Serial.print("Initializing thermocouple 1...");
+    // Start LittleFS
+    Serial.printf("Initializing LittleFS...");
+    if (!LittleFS.begin())
+    {
+        Serial.printf("failed\n");
+        while (true)
+        {
+            delay(10);
+        }
+    }
+    else
+    {
+        Serial.printf("done.\n");
+    }
+
+    // Open config file for reading
+    Serial.printf("Opening config file...");
+    File configFile = LittleFS.open("/config.json", "r");
+    if (!configFile)
+    {
+        Serial.printf("failed\n");
+        while (true)
+        {
+            delay(10);
+        }
+    }
+    else
+    {
+        Serial.printf("done.\n");
+    }
+
+    // Read config file into config object
+    Serial.printf("Reading config file...");
+    if (!config.readConfig(configFile))
+    {
+        Serial.printf("failed\n");
+        while (true)
+        {
+            delay(10);
+        }
+    }
+    else
+    {
+        configFile.close();
+        Serial.printf("done.\n");
+    }
+
+    WiFi.begin(config.getSSID(), config.getKey());
+
+    Serial.printf("Connecting to WiFi...");
+    while (WiFi.status() != WL_CONNECTED)
+    {
+        delay(1000);
+    }
+    Serial.printf("done.\n");
+
+    IPAddress localAddr = WiFi.localIP();
+    Serial.printf("IP: %s\n", localAddr.toString().c_str());
+
+    if (!MDNS.begin(config.getMDNS()))
+    {
+        Serial.println("Error setting up mDNS responder");
+    }
+    else
+    {
+        Serial.printf("mDNS: %s\n", config.getMDNS());
+    }
+
+    Serial.printf("Initializing thermocouple 1...");
     if (!thermocouple1.begin())
     {
         Serial.println("ERROR.");
-        while (1)
+        while (true)
+        {
             delay(10);
+        }
     }
-    Serial.println("DONE.");
-    Serial.print("Initializing thermocouple 2...");
+    Serial.printf("done.\n");
+
+    Serial.printf("Initializing thermocouple 2...");
     if (!thermocouple2.begin())
     {
         Serial.println("ERROR.");
-        while (1)
+        while (true)
+        {
             delay(10);
+        }
     }
-    Serial.println("DONE.");
-    Serial.print("Initializing OLED...");
+    Serial.printf("done.\n");
+
+    // Start thermocouple reader task
+    if (xTaskCreate(readThermocouples,
+                    "Read TCs",
+                    1024,
+                    0,
+                    1,
+                    &tcTaskHandle) == pdPASS)
+    {
+        Serial.println("Thermocouple task started");
+    }
+    else
+    {
+        Serial.println("Failed to start thermocouple task");
+        while (true)
+        {
+            delay(10);
+        }
+    }
+
+    Serial.printf("Initializing OLED...");
     Wire.setPins(SDA_PIN, SCL_PIN);
     if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C))
     {
@@ -135,181 +278,137 @@ void setup()
         while (1)
             delay(10);
     }
-    Serial.println("DONE.");
+    Serial.printf("done.\n");
 
     // Set up ADC (MAX11645)
-    Serial.print("Initializing external ADC...");
+    Serial.printf("Initializing external ADC...");
     Wire.begin();
     Wire.beginTransmission((uint16_t)ADC_ADDR);
     Wire.write((uint8_t)0b10100000);
     Wire.write((uint8_t)0b01100001);
     Wire.endTransmission();
-    Serial.println("DONE.");
+    Serial.printf("done.\n");
 
     display.clearDisplay();
     display.setTextSize(1);
     display.setTextColor(SSD1306_WHITE);
     display.display();
 
-    // Set up on board GPIO0 button, but
-    // don't attach interrupt now. It
-    // will be attached after a delay in
-    // loop
+    // Create the i2c mutex
+    i2cMutex = xSemaphoreCreateMutex();
+
+    // Start lmt85 reader task
+    if (xTaskCreate(readLMT85,
+                    "Read LMT85",
+                    2048,
+                    &i2cMutex,
+                    1,
+                    &lmt85TaskHandle) == pdPASS)
+    {
+        Serial.println("LMT85 reader task started");
+    }
+    else
+    {
+        Serial.println("Failed to start LMT85 reader task");
+        while (true)
+        {
+            delay(10);
+        }
+    }
+
+    // Start display update task
+    if (xTaskCreate(updateDisplay,
+                    "Display Update",
+                    4096,
+                    &i2cMutex,
+                    1,
+                    &updateDisplayTaskHandle) == pdPASS)
+    {
+        Serial.println("display update task started");
+    }
+    else
+    {
+        Serial.println("Failed to start display update task");
+        while (true)
+        {
+            delay(10);
+        }
+    }
+
+    // Set up on board GPIO0 button
+    // Note that its interrupt will
+    // be attached in btnDebounce()
+    // after a 2 second timer
+    // expires
     pinMode(BTN_PIN, INPUT);
     btnTimerArgs.callback = btnDebounce;
-    esp_timer_create(&btnTimerArgs, &btnTimer);
-    enableButtonTime = millis() + 5000;
+    if (esp_timer_create(&btnTimerArgs, &btnTimer) != ESP_OK)
+    {
+        Serial.println("Failed to create esp timer for button debouncing");
+        while (true)
+        {
+            delay(10);
+        }
+    }
+    esp_timer_start_once(btnTimer, 2000);
 
-    windowStartTime = millis();
+    // Start CSV server task
+    if (xTaskCreate(csvServer,
+                    "CSV Server",
+                    4096,
+                    &i2cMutex,
+                    1,
+                    &csvServerTaskHandle) == pdPASS)
+    {
+        Serial.println("CSV server task started");
+    }
+    else
+    {
+        Serial.println("Failed to start CSV server task");
+        while (true)
+        {
+            delay(10);
+        }
+    }
+
+    // Set PID output limits based on
+    // PWM resolution, sample time based on
+    // loop delay time, and automatic mode
     int maxForResolution = (1 << resolution) - 1;
     Serial.printf("resolution: %d maxLimit: %d\n", resolution, maxForResolution);
     pid.SetOutputLimits(0, maxForResolution);
     pid.SetSampleTime(loopDelay);
     pid.SetMode(AUTOMATIC);
-
-    nextDisplayUpdate = millis();
 }
 
 void loop()
 {
-    double c = 0.0;
-    bool displayStuffHappened = false;
-    unsigned long now = millis();
-
-    // Attach interrupt for GPIO0 button
-    // if the delay has passed and the button
-    // is not being pressed
-    if (!buttonEnabled &&
-        (now > enableButtonTime) &&
-        (digitalRead(BTN_PIN) == HIGH))
+    if (reflowCurveRunning)
     {
-        Serial.println("Enabling button");
-        attachInterrupt(BTN_PIN, btnHandler, FALLING);
-        buttonEnabled = true;
-    }
-
-    // Read TC1 input
-    c = thermocouple1.readCelsius();
-    if (isnan(c))
-    {
-        Serial.println("Thermocouple 1 fault(s) detected!");
-        uint8_t e = thermocouple1.readError();
-        if (e & MAX31855_FAULT_OPEN)
-            Serial.println("FAULT: Thermocouple is open - no connections.");
-        if (e & MAX31855_FAULT_SHORT_GND)
-            Serial.println("FAULT: Thermocouple is short-circuited to GND.");
-        if (e & MAX31855_FAULT_SHORT_VCC)
-            Serial.println("FAULT: Thermocouple is short-circuited to VCC.");
+        if (cancelReflowCurve)
+        {
+            cancelReflowCurve = false;
+            reflowCurveRunning = false;
+            data.setSetpoint(0.0);
+            Serial.println("Canceling reflow curve");
+        }
     }
     else
     {
-        if (c != tc1TempC)
+        if (startReflowCurve)
         {
-            // Save new value
-            tc1TempC = c;
-        }
-
-        // Update display
-        if (now > nextDisplayUpdate)
-        {
-            display.fillRect(tc1TempX, tc1TempY, tc1TempWidth, tc1TempHeight, SSD1306_BLACK);
-            display.setCursor(tc1TempX, tc1TempY);
-            display.printf("T1: %6.2f C %6.2f F", tc1TempC, c2f(tc1TempC));
-            displayStuffHappened = true;
+            startReflowCurve = false;
+            reflowCurveRunning = true;
+            Serial.println("Starting reflow curve");
         }
     }
 
     // Compute output power based on TC1
     // input and apply it
+    pidInput = data.getTc1Temp();
+    pidSetpoint = data.getSetpoint();
     pid.Compute();
     ledcWrite(ledChannel, pidOutput);
-
-    // Read TC2 input
-    c = thermocouple2.readCelsius();
-    if (isnan(c))
-    {
-        Serial.println("Thermocouple 2 fault(s) detected!");
-        uint8_t e = thermocouple2.readError();
-        if (e & MAX31855_FAULT_OPEN)
-            Serial.println("FAULT: Thermocouple is open - no connections.");
-        if (e & MAX31855_FAULT_SHORT_GND)
-            Serial.println("FAULT: Thermocouple is short-circuited to GND.");
-        if (e & MAX31855_FAULT_SHORT_VCC)
-            Serial.println("FAULT: Thermocouple is short-circuited to VCC.");
-    }
-    else
-    {
-        if (c != tc2TempC)
-        {
-            // Save new value
-            tc2TempC = c;
-        }
-
-        // Update display
-        if (now > nextDisplayUpdate)
-        {
-            display.fillRect(tc2TempX, tc2TempY, tc2TempWidth, tc2TempHeight, SSD1306_BLACK);
-            display.setCursor(tc2TempX, tc2TempY);
-            display.printf("T2: %6.2f C %6.2f F", tc2TempC, c2f(tc2TempC));
-            displayStuffHappened = true;
-        }
-    }
-
-    // Read the value of the LMT85
-    uint16_t lmt85Counts = 0;
-
-    // Request 2 bytes from the external ADC
-    uint8_t bytesReceived = Wire.requestFrom(ADC_ADDR, 2);
-    if (bytesReceived == 2)
-    {
-        uint8_t tmp[2];
-        Wire.readBytes(tmp, 2);
-        lmt85Counts = ((tmp[0] << 8) | tmp[1]) & 0x0fff;
-    }
-
-    // Voltage reference is 2.048V, ADC is 12-bit
-    // (4096 counts); thus, each count represents
-    // 0.5mV
-    int tmp = lmt85Counts / 2;
-    if (tmp != lmt85_mV)
-    {
-        // Save new value
-        lmt85_mV = tmp;
-    }
-
-    // Update display
-    if (now > nextDisplayUpdate)
-    {
-        // Look up temp for this voltage
-        double c = getLMT85Temp(lmt85_mV);
-
-        display.fillRect(lmt85X, lmt85Y, lmt85Width, lmt85Height, SSD1306_BLACK);
-        display.setCursor(lmt85X, lmt85Y);
-        display.printf("LM: %6.2f C %6.2f F", c, c2f(c));
-        displayStuffHappened = true;
-    }
-
-    if (pendingSetpoint != setpoint)
-    {
-        setpoint = pendingSetpoint;
-
-        // Update display
-        display.fillRect(setpointX, setpointY, setpointWidth, setpointHeight, SSD1306_BLACK);
-        display.setCursor(setpointX, setpointY);
-        display.printf("SP: %6.2f C %6.2f F", setpoint, c2f(setpoint));
-        displayStuffHappened = true;
-    }
-
-    // Update actual display
-    if (displayStuffHappened)
-    {
-        display.display();
-    }
-
-    if (now > nextDisplayUpdate)
-    {
-        nextDisplayUpdate += 500;
-    }
 
     delay(loopDelay);
 }
@@ -319,6 +418,337 @@ double c2f(double celsius)
     return (celsius * (9.0 / 5.0)) + 32;
 }
 
+void readThermocouples(void *)
+{
+    double c;
+    double tc1Samples[tcNumSamplesToAvg];
+    double tc2Samples[tcNumSamplesToAvg];
+    int sampleIdx = 0;
+    int count = 0;
+
+    while (true)
+    {
+        // Read TC1 input
+        c = thermocouple1.readCelsius();
+        if (isnan(c))
+        {
+            Serial.println("Thermocouple 1 fault(s) detected!");
+            uint8_t e = thermocouple1.readError();
+            if (e & MAX31855_FAULT_OPEN)
+            {
+                Serial.println("FAULT: Thermocouple is open - no connections.");
+            }
+            if (e & MAX31855_FAULT_SHORT_GND)
+            {
+                Serial.println("FAULT: Thermocouple is short-circuited to GND.");
+            }
+            if (e & MAX31855_FAULT_SHORT_VCC)
+            {
+                Serial.println("FAULT: Thermocouple is short-circuited to VCC.");
+            }
+        }
+        else
+        {
+            tc1Samples[sampleIdx] = c;
+
+            if (count == tcNumSamplesToAvg)
+            {
+                double sum = 0.0;
+                for (int i = 0; i < tcNumSamplesToAvg; i++)
+                {
+                    sum += tc1Samples[i];
+                }
+
+                double avg = sum / tcNumSamplesToAvg;
+                data.setTc1Temp(avg);
+            }
+        }
+
+        // Read TC2 input
+        c = thermocouple2.readCelsius();
+        if (isnan(c))
+        {
+            Serial.println("Thermocouple 2 fault(s) detected!");
+            uint8_t e = thermocouple1.readError();
+            if (e & MAX31855_FAULT_OPEN)
+            {
+                Serial.println("FAULT: Thermocouple is open - no connections.");
+            }
+            if (e & MAX31855_FAULT_SHORT_GND)
+            {
+                Serial.println("FAULT: Thermocouple is short-circuited to GND.");
+            }
+            if (e & MAX31855_FAULT_SHORT_VCC)
+            {
+                Serial.println("FAULT: Thermocouple is short-circuited to VCC.");
+            }
+        }
+        else
+        {
+            tc2Samples[sampleIdx] = c;
+
+            if (count == tcNumSamplesToAvg)
+            {
+                double sum = 0.0;
+                for (int i = 0; i < tcNumSamplesToAvg; i++)
+                {
+                    sum += tc2Samples[i];
+                }
+
+                double avg = sum / tcNumSamplesToAvg;
+                data.setTc2Temp(avg);
+            }
+        }
+
+        // Update count until we have
+        // enough samples to start averaging
+        if (count < tcNumSamplesToAvg)
+        {
+            count++;
+        }
+
+        // Update sampleIdx
+        sampleIdx = (sampleIdx + 1) % tcNumSamplesToAvg;
+
+        // Wait for next sample interval
+        vTaskDelay(tcDelay / portTICK_PERIOD_MS);
+    }
+}
+
+void readLMT85(void *)
+{
+    double c;
+    double samples[lmt85NumSamplesToAvg];
+    int sampleIdx = 0;
+    int count = 0;
+
+    while (true)
+    {
+        // Read the value of the LMT85
+        uint16_t lmt85Counts = 0;
+
+        // Take the mutex
+        xSemaphoreTake(i2cMutex, portMAX_DELAY);
+
+        // Request 2 bytes from the external ADC
+        uint8_t bytesReceived = Wire.requestFrom(ADC_ADDR, 2);
+        if (bytesReceived == 2)
+        {
+            uint8_t tmp[2];
+            Wire.readBytes(tmp, 2);
+            lmt85Counts = ((tmp[0] << 8) | tmp[1]) & 0x0fff;
+        }
+
+        // Give the mutex back
+        xSemaphoreGive(i2cMutex);
+
+        // Voltage reference is 2.048V, ADC is 12-bit
+        // (4096 counts); thus, each count represents
+        // 0.5mV
+        int tmp = lmt85Counts / 2;
+        samples[sampleIdx] = tmp;
+
+        if (count == lmt85NumSamplesToAvg)
+        {
+            int sum = 0.0;
+            for (int i = 0; i < tcNumSamplesToAvg; i++)
+            {
+                sum += samples[i];
+            }
+
+            int avg = sum / lmt85NumSamplesToAvg;
+            data.setLmt85_mV(avg);
+        }
+
+        // Update count until we have
+        // enough samples to start averaging
+        if (count < lmt85NumSamplesToAvg)
+        {
+            count++;
+        }
+
+        // Update sampleIdx
+        sampleIdx = (sampleIdx + 1) % lmt85NumSamplesToAvg;
+
+        // Wait for next sample interval
+        vTaskDelay(lmt85Delay / portTICK_PERIOD_MS);
+    }
+}
+
+void updateDisplay(void *)
+{
+    const int tc1TempX = 0;
+    const int tc1TempY = 1;
+    const int tc1TempWidth = SCREEN_WIDTH;
+    const int tc1TempHeight = 8;
+    const int tc2TempX = 0;
+    const int tc2TempY = 11;
+    const int tc2TempWidth = SCREEN_WIDTH;
+    const int tc2TempHeight = 8;
+    const int lmt85X = 0;
+    const int lmt85Y = 21;
+    const int lmt85Width = SCREEN_WIDTH;
+    const int lmt85Height = 8;
+    const int setpointX = 0;
+    const int setpointY = 31;
+    const int setpointWidth = SCREEN_WIDTH;
+    const int setpointHeight = 8;
+
+    double currentTc1TempC = -1.0;
+    double currentTc2TempC = -1.0;
+    int currentLmt85_mV = -1;
+    double currentSetpoint = -1.0;
+    bool displayNeedsRefresh = false;
+
+    while (true)
+    {
+        // TC1
+        double tmp = data.getTc1Temp();
+        if (tmp != currentTc1TempC)
+        {
+            currentTc1TempC = tmp;
+
+            display.fillRect(tc1TempX, tc1TempY, tc1TempWidth, tc1TempHeight, SSD1306_BLACK);
+            display.setCursor(tc1TempX, tc1TempY);
+            display.printf("T1: %6.2f C %6.2f F", currentTc1TempC, c2f(currentTc1TempC));
+
+            displayNeedsRefresh = true;
+        }
+
+        // TC2
+        tmp = data.getTc2Temp();
+        if (tmp != currentTc2TempC)
+        {
+            currentTc2TempC = tmp;
+
+            display.fillRect(tc2TempX, tc2TempY, tc2TempWidth, tc2TempHeight, SSD1306_BLACK);
+            display.setCursor(tc2TempX, tc2TempY);
+            display.printf("T2: %6.2f C %6.2f F", currentTc2TempC, c2f(currentTc2TempC));
+
+            displayNeedsRefresh = true;
+        }
+
+        // LMT85
+        int tmp2 = data.getLmt85_mV();
+        if (tmp2 != currentLmt85_mV)
+        {
+            currentLmt85_mV = tmp2;
+
+            // Look up temp for this voltage
+            double c = getLMT85Temp(currentLmt85_mV);
+
+            display.fillRect(lmt85X, lmt85Y, lmt85Width, lmt85Height, SSD1306_BLACK);
+            display.setCursor(lmt85X, lmt85Y);
+            display.printf("LM: %6.2f C %6.2f F", c, c2f(c));
+
+            displayNeedsRefresh = true;
+        }
+
+        // Set point
+        tmp = data.getSetpoint();
+        if (tmp != currentSetpoint)
+        {
+            currentSetpoint = tmp;
+
+            display.fillRect(setpointX, setpointY, setpointWidth, setpointHeight, SSD1306_BLACK);
+            display.setCursor(setpointX, setpointY);
+            display.printf("SP: %6.2f C %6.2f F", currentSetpoint, c2f(currentSetpoint));
+
+            displayNeedsRefresh = true;
+        }
+
+        // Actually update the display if anything
+        // has changed
+        if (displayNeedsRefresh)
+        {
+            displayNeedsRefresh = false;
+
+            // Take the semaphore
+            xSemaphoreTake(i2cMutex, portMAX_DELAY);
+
+            // Send updates to display via i2c
+            display.display();
+
+            // Give the mutex back
+            xSemaphoreGive(i2cMutex);
+        }
+
+        // Wait for the next refresh interval
+        vTaskDelay(displayRefreshPeriod / portTICK_PERIOD_MS);
+    }
+}
+
+void csvServer(void *)
+{
+    // Accept up to 10 connections
+    const int maxConns = 10;
+    Connection conns[maxConns];
+
+    // Create a server object
+    WiFiServer server(csvServerPort);
+
+    // Start server
+    server.begin();
+
+    while (true)
+    {
+        unsigned long loopStart = millis();
+
+        // Handle new connections
+        while (server.hasClient())
+        {
+            bool connectionAccepted = false;
+            for (int i = 0; i < maxConns; i++)
+            {
+                if (!conns[i].client.connected())
+                {
+                    // Accept connection
+                    conns[i].client = server.available();
+                    conns[i].zeroMillis = loopStart;
+
+                    // Send CSV headers
+                    conns[i].client.printf("Time,\"Set Point\",\"Under Heater\",\"Target Board\",\"Built-In Temp\",\"PID Output\",\"Kp=%0.2f Ki=%0.2f Kd=%0.2f\"\n",
+                                           Kp, Ki, Kd);
+
+                    // Set flag
+                    connectionAccepted = true;
+                }
+            }
+
+            if (!connectionAccepted)
+            {
+                // No slots left; reject
+                // connection
+                server.available().stop();
+            }
+        }
+
+        // Send CSV data to connected
+        // clients
+        for (int i = 0; i < maxConns; i++)
+        {
+            if (conns[i].client.connected())
+            {
+                unsigned long reportTime = loopStart - conns[i].zeroMillis;
+                conns[i].client.printf("%0.2f,%0.2f,%0.2f,%0.2f,%0.2f,%0.2f\n",
+                                       (double)reportTime / 1000.0,
+                                       data.getSetpoint(),
+                                       data.getTc1Temp(),
+                                       data.getTc2Temp(),
+                                       getLMT85Temp(data.getLmt85_mV()),
+                                       pidOutput / 40.95);
+            }
+        }
+
+        // Wait for next reporting interval
+        int delay = csvReportingDelay - (millis() - loopStart);
+        if (delay > 0)
+        {
+            vTaskDelay(delay / portTICK_PERIOD_MS);
+        }
+    }
+}
+
 void IRAM_ATTR btnHandler()
 {
     // Software switch debounce:
@@ -326,23 +756,16 @@ void IRAM_ATTR btnHandler()
     // timer to re-attach it after
     // debounceTime_us microseconds
     detachInterrupt(BTN_PIN);
-    if (btnTimer != 0)
-    {
-        esp_timer_start_once(btnTimer, debounceTime_us);
-    }
-    else
-    {
-        Serial.println("Holy shit its null");
-    }
+    esp_timer_start_once(btnTimer, debounceTime_us);
 
-    // Change the set point
-    if (setpoint == lowTemp)
+    // Start or cancel the reflow curve
+    if (!reflowCurveRunning)
     {
-        pendingSetpoint = highTemp;
+        startReflowCurve = true;
     }
     else
     {
-        pendingSetpoint = lowTemp;
+        cancelReflowCurve = true;
     }
 }
 
