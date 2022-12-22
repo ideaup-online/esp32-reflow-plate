@@ -1,4 +1,4 @@
-1360117115323022
+1361788797677980
 Connector_PinHeader
 PinHeader_1x01_P2.54mm_Horizontal
 Through hole angled pin header, 1x01, 2.54mm pitch, 6mm pin length, single row
@@ -5741,6 +5741,13 @@ IdeaUpLogoText6mm
 0
 graphic footprints
 IdeaUpLogoText7mm
+
+
+0
+0
+0
+graphic footprints
+OSH9mm
 
 
 0
