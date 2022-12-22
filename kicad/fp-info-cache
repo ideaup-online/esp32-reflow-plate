@@ -1,4 +1,4 @@
-1361788797677980
+1365132037955423
 Connector_PinHeader
 PinHeader_1x01_P2.54mm_Horizontal
 Through hole angled pin header, 1x01, 2.54mm pitch, 6mm pin length, single row
@@ -5725,6 +5725,20 @@ Zigbee_Module_MRF24J40MD
 0
 12
 12
+footprint
+IdeaUpLogoText7mm
+
+
+0
+0
+0
+footprint
+OSH9mm
+
+
+0
+0
+0
 footprint
 hotstuff20mm
 
